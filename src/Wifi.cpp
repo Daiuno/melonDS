@@ -2474,4 +2474,11 @@ const u8* Wifi::GetBSSID() const
     return (u8*)&IOPORT(W_BSSID0);
 }
 
+int Wifi::GetWfcStatus() const
+{
+    if (WifiAP)
+        return WifiAP->GetWfcStatus();
+    return 0; // disconnected
+}
+
 }

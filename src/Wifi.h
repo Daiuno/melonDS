@@ -173,6 +173,10 @@ public:
     const u8* GetMAC() const;
     const u8* GetBSSID() const;
 
+    // Get WFC connection status from WifiAP
+    // 0=disconnected 1=authenticated 2=associated
+    int GetWfcStatus() const;
+
 private:
     melonDS::NDS& NDS;
     u8 RAM[0x2000];

@@ -42,6 +42,10 @@ public:
     int SendPacket(const u8* data, int len);
     int RecvPacket(u8* data);
 
+    // Get WFC connection status
+    // 0=disconnected 1=authenticated 2=associated
+    int GetWfcStatus() const { return ClientStatus; }
+
 private:
     Wifi* Client;
     void* UserData;
