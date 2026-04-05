@@ -98,7 +98,7 @@ class Compiler : public Arm64Gen::ARM64XEmitter
 public:
     typedef void (Compiler::*CompileFunc)();
 
-    explicit Compiler(melonDS::NDS& nds);
+    explicit Compiler(melonDS::NDS& nds, bool enableJIT = true);
     ~Compiler() override;
 
     void PushRegs(bool saveHiRegs, bool saveRegsToBeChanged, bool allowUnload = true);
@@ -274,6 +274,16 @@ public:
     void* JitRWBase;
     void* JitRWStart;
     void* JitRXStart;
+#endif
+
+#if defined(__APPLE__) && defined(__aarch64__)
+    void* JitRWBase_Apple = nullptr;
+    void* JitRXBase_Apple = nullptr;
+    u64 JitMemAllocSize_Apple = 0;
+    bool IsDualMapping_Apple = false;
+    bool IsLegacyMprotect_Apple = false;
+    void* LegacyJitBase_Apple = nullptr;
+    u64 LegacyJitSize_Apple = 0;
 #endif
 
     void* ReadBanked, *WriteBanked;

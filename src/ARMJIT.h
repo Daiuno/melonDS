@@ -47,7 +47,7 @@ public:
     ARMJIT(melonDS::NDS& nds, std::optional<JITArgs> jit) noexcept :
         NDS(nds),
         Memory(nds),
-        JITCompiler(nds),
+        JITCompiler(nds, jit.has_value()),
         MaxBlockSize(jit.has_value() ? std::clamp(jit->MaxBlockSize, 1u, 32u) : 32),
         LiteralOptimizations(jit.has_value() ? jit->LiteralOptimizations : false),
         BranchOptimizations(jit.has_value() ? jit->BranchOptimizations : false),
@@ -60,6 +60,7 @@ public:
     void Reset() noexcept;
     void JitEnableWrite() noexcept;
     void JitEnableExecute() noexcept;
+    bool IsDualMappingMode() const noexcept;
     void CompileBlock(ARM* cpu) noexcept;
     void ResetBlockCache() noexcept;
 
@@ -199,6 +200,7 @@ public:
     void Reset() noexcept {}
     void JitEnableWrite() noexcept {}
     void JitEnableExecute() noexcept {}
+    bool IsDualMappingMode() const noexcept { return false; }
     void CompileBlock(ARM*) noexcept {}
     void ResetBlockCache() noexcept {}
     template <u32, int>

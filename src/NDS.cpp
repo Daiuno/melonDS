@@ -1059,6 +1059,17 @@ u32 NDS::RunFrame()
 
 u32 NDS::RunFrame()
 {
+    static bool firstFrameLogged = false;
+    if (!firstFrameLogged)
+    {
+        firstFrameLogged = true;
+#ifdef JIT_ENABLED
+        Log(LogLevel::Info, "[MelonDS-JIT] First frame: EnableJIT=%s\n", EnableJIT ? "true" : "false");
+#else
+        Log(LogLevel::Info, "[MelonDS-JIT] First frame: JIT not compiled in\n");
+#endif
+    }
+
 #ifdef JIT_ENABLED
     if (EnableJIT)
         return RunFrame<CPUExecuteMode::JIT>();

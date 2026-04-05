@@ -34,6 +34,10 @@
 #include <sys/ioctl.h>
 #endif
 
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+
 #include "ARMJIT.h"
 #include "ARMJIT_Memory.h"
 
@@ -274,6 +278,8 @@ bool ARMJIT_Memory::MapIntoRange(u32 addr, u32 num, u32 offset, u32 size) noexce
     bool r = MapViewOfFileEx(MemoryFile, FILE_MAP_READ | FILE_MAP_WRITE, 0, offset, size, dst) == dst;
     return r;
 #else
+    if (!(num == 0 ? FastMem9Start : FastMem7Start))
+        return false;
     return mmap(dst, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, MemoryFile, offset) != MAP_FAILED;
 #endif
 }
@@ -288,6 +294,8 @@ bool ARMJIT_Memory::UnmapFromRange(u32 addr, u32 num, u32 offset, u32 size) noex
 #elif defined(_WIN32)
     return UnmapViewOfFile(dst);
 #else
+    if (!(num == 0 ? FastMem9Start : FastMem7Start))
+        return true;
     return munmap(dst, size) == 0;
 #endif
 }
@@ -307,6 +315,8 @@ void ARMJIT_Memory::SetCodeProtectionRange(u32 addr, u32 size, u32 num, int prot
     bool success = VirtualProtect(dst, size, winProtection, &oldProtection);
     assert(success);
 #else
+    if (!(num == 0 ? FastMem9Start : FastMem7Start))
+        return;
     int posixProt;
     if (protection == 0)
         posixProt = PROT_NONE;
@@ -693,6 +703,32 @@ ARMJIT_Memory::ARMJIT_Memory(melonDS::NDS& nds) : NDS(nds)
     // The idea was to give the OS more freedom where to position the buffers,
     // but something was bad about this so instead we take this vmem eating monster
     // which seems to work better.
+
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    // iOS: shm_open is forbidden by App Sandbox.
+    // Since FastMem is not supported on iOS (HAVE_JIT_FASTMEM is not defined),
+    // we don't need shared memory for remapping. Use a simple anonymous mmap.
+    MemoryBase = (u8*)mmap(NULL, MemoryTotalSize, PROT_READ | PROT_WRITE,
+                           MAP_ANON | MAP_PRIVATE, -1, 0);
+    if (MemoryBase == MAP_FAILED)
+    {
+        Log(LogLevel::Error, "Failed to mmap anonymous memory for JIT! (%s)", strerror(errno));
+        MemoryBase = nullptr;
+    }
+    FastMem9Start = nullptr;
+    FastMem7Start = nullptr;
+    MemoryFile = -1;
+
+    struct sigaction sa;
+    sa.sa_handler = nullptr;
+    sa.sa_sigaction = &SigsegvHandler;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, &OldSaSegv);
+    sigaction(SIGBUS, &sa, &OldSaBus);
+
+    u8* basePtr = MemoryBase;
+#else
     MemoryBase = (u8*)mmap(NULL, AddrSpaceSize*4, PROT_NONE, MAP_ANON | MAP_PRIVATE, -1, 0);
     munmap(MemoryBase, AddrSpaceSize*4);
     FastMem9Start = MemoryBase;
@@ -743,6 +779,7 @@ ARMJIT_Memory::ARMJIT_Memory(melonDS::NDS& nds) : NDS(nds)
     mmap(MemoryBase, MemoryTotalSize, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, MemoryFile, 0);
 
     u8* basePtr = MemoryBase;
+#endif // !(__APPLE__ && TARGET_OS_IPHONE)
 #endif
 }
 
@@ -834,6 +871,10 @@ void ARMJIT_Memory::Reset() noexcept
 
 bool ARMJIT_Memory::IsFastmemCompatible(int region) const noexcept
 {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    // FastMem is not supported on iOS - no shared memory file, no 4GB address space
+    return false;
+#endif
 #ifdef _WIN32
     /*
         TODO: with some hacks, the smaller shared WRAM regions

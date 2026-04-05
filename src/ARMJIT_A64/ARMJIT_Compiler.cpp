@@ -34,6 +34,39 @@ extern char __start__;
 #include <unistd.h>
 #endif
 
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#if TARGET_OS_IPHONE && defined(__aarch64__)
+#include <mach/mach.h>
+#include <mach/vm_map.h>
+#include <sys/sysctl.h>
+#include <dirent.h>
+#include <cstring>
+#include <cerrno>
+
+#ifndef MAP_MEM_NAMED_CREATE
+#define MAP_MEM_NAMED_CREATE 0x020000
+#endif
+#ifndef MAP_MEM_LEDGER_TAGGED
+#define MAP_MEM_LEDGER_TAGGED 0x002000
+#endif
+#ifndef VM_LEDGER_TAG_DEFAULT
+#define VM_LEDGER_TAG_DEFAULT 0x00000001
+#endif
+#ifndef VM_LEDGER_FLAG_NO_FOOTPRINT
+#define VM_LEDGER_FLAG_NO_FOOTPRINT 0x00000001
+#endif
+
+extern "C" {
+    kern_return_t mach_memory_entry_ownership(
+        mem_entry_name_port_t mem_entry,
+        mach_port_t owner,
+        int ledger_tag,
+        int ledger_flags) __attribute__((weak_import));
+}
+#endif
+#endif
+
 #include <stdlib.h>
 
 using namespace Arm64Gen;
@@ -70,6 +103,100 @@ const int JitMemSize = 16 * 1024 * 1024;
 #ifndef __SWITCH__
 u8 JitMem[JitMemSize];
 #endif
+
+#if defined(__APPLE__) && TARGET_OS_IPHONE && defined(__aarch64__)
+
+static bool MelonDS_FindPathWithLength(const char* basePath, size_t targetLength, char* outPath, size_t outSize)
+{
+    DIR* dir = opendir(basePath);
+    if (!dir) return false;
+
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != nullptr)
+    {
+        if (strlen(entry->d_name) == targetLength)
+        {
+            snprintf(outPath, outSize, "%s/%s", basePath, entry->d_name);
+            closedir(dir);
+            return true;
+        }
+    }
+    closedir(dir);
+    return false;
+}
+
+static bool MelonDS_IsIOS26OrLater()
+{
+    static int cachedResult = -1;
+    if (cachedResult >= 0) return cachedResult != 0;
+
+    char versionStr[256] = {0};
+    size_t size = sizeof(versionStr);
+    if (sysctlbyname("kern.osproductversion", versionStr, &size, nullptr, 0) == 0)
+    {
+        int major = atoi(versionStr);
+        cachedResult = (major >= 26) ? 1 : 0;
+    }
+    else
+    {
+        cachedResult = 0;
+    }
+    return cachedResult != 0;
+}
+
+static bool MelonDS_DeviceHasTXM()
+{
+    static int cachedResult = -1;
+    if (cachedResult >= 0) return cachedResult != 0;
+
+    cachedResult = 0;
+
+    char bootUuidPath[512];
+    if (MelonDS_FindPathWithLength("/System/Volumes/Preboot", 36, bootUuidPath, sizeof(bootUuidPath)))
+    {
+        char bootDir[512];
+        snprintf(bootDir, sizeof(bootDir), "%s/boot", bootUuidPath);
+
+        char ninetySixPath[512];
+        if (MelonDS_FindPathWithLength(bootDir, 96, ninetySixPath, sizeof(ninetySixPath)))
+        {
+            char txmPath[1024];
+            snprintf(txmPath, sizeof(txmPath),
+                     "%s/usr/standalone/firmware/FUD/Ap,TrustedExecutionMonitor.img4",
+                     ninetySixPath);
+            if (access(txmPath, F_OK) == 0)
+            {
+                cachedResult = 1;
+                return true;
+            }
+        }
+    }
+
+    char fallbackPath[512];
+    if (MelonDS_FindPathWithLength("/private/preboot", 96, fallbackPath, sizeof(fallbackPath)))
+    {
+        char txmPath[1024];
+        snprintf(txmPath, sizeof(txmPath),
+                 "%s/usr/standalone/firmware/FUD/Ap,TrustedExecutionMonitor.img4",
+                 fallbackPath);
+        if (access(txmPath, F_OK) == 0)
+        {
+            cachedResult = 1;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static size_t MelonDS_AlignToPage(size_t size)
+{
+    size_t pageSize = (size_t)sysconf(_SC_PAGESIZE);
+    if (pageSize == 0) pageSize = 16384;
+    return (size + pageSize - 1) & ~(pageSize - 1);
+}
+
+#endif // __APPLE__ && TARGET_OS_IPHONE && __aarch64__
 
 void Compiler::MovePC()
 {
@@ -221,8 +348,15 @@ void Compiler::PopRegs(bool saveHiRegs, bool saveRegsToBeChanged)
     }
 }
 
-Compiler::Compiler(melonDS::NDS& nds) : Arm64Gen::ARM64XEmitter(), NDS(nds)
+Compiler::Compiler(melonDS::NDS& nds, bool enableJIT) : Arm64Gen::ARM64XEmitter(), NDS(nds)
 {
+    if (!enableJIT)
+    {
+        Log(LogLevel::Info, "[MelonDS-JIT] Compiler: JIT disabled, skipping memory allocation\n");
+        JitMemMainSize = 0;
+        return;
+    }
+
 #ifdef __SWITCH__
     JitRWBase = aligned_alloc(0x1000, JitMemSize);
 
@@ -275,14 +409,200 @@ Compiler::Compiler(melonDS::NDS& nds) : Arm64Gen::ARM64XEmitter(), NDS(nds)
         DWORD dummy;
         VirtualProtect(pageAligned, alignedSize, PAGE_EXECUTE_READWRITE, &dummy);
     #elif defined(__APPLE__)
-        pageAligned = (u8*)mmap(NULL, 1024*1024*16, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT,-1, 0);
+
+    #if TARGET_OS_IPHONE && defined(__aarch64__)
+    {
+        bool isIOS26 = MelonDS_IsIOS26OrLater();
+        bool hasTXM = isIOS26 ? MelonDS_DeviceHasTXM() : false;
+
+        Log(LogLevel::Info, "[MelonDS-JIT] Compiler init: iOS26=%s, TXM=%s\n",
+            isIOS26 ? "true" : "false", hasTXM ? "true" : "false");
+
+        if (isIOS26 && hasTXM)
+        {
+            // iOS 26+ TXM: dual mapping via mach_make_memory_entry_64
+            size_t allocSize = MelonDS_AlignToPage(JitMemSize);
+
+            memory_object_size_t memorySize = allocSize;
+            mach_port_t memoryEntry = MACH_PORT_NULL;
+
+            kern_return_t ret = mach_make_memory_entry_64(
+                mach_task_self(),
+                &memorySize,
+                0,
+                MAP_MEM_NAMED_CREATE | MAP_MEM_LEDGER_TAGGED |
+                VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE,
+                &memoryEntry,
+                MACH_PORT_NULL
+            );
+
+            if (ret != KERN_SUCCESS || memorySize < allocSize)
+            {
+                if (memoryEntry != MACH_PORT_NULL)
+                    mach_port_deallocate(mach_task_self(), memoryEntry);
+                Log(LogLevel::Error, "melonDS JIT: mach_make_memory_entry_64 failed (ret=0x%x)\n", ret);
+                abort();
+            }
+
+            size_t actualSize = (size_t)memorySize;
+
+            if (mach_memory_entry_ownership != nullptr)
+            {
+                mach_memory_entry_ownership(
+                    memoryEntry, MACH_PORT_NULL,
+                    VM_LEDGER_TAG_DEFAULT, VM_LEDGER_FLAG_NO_FOOTPRINT);
+            }
+
+            // Map RX region
+            vm_address_t rxAddr = 0;
+            ret = vm_map(
+                mach_task_self(), &rxAddr, actualSize, 0,
+                VM_FLAGS_ANYWHERE, memoryEntry, 0, FALSE,
+                VM_PROT_READ | VM_PROT_EXECUTE,
+                VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE,
+                VM_INHERIT_COPY
+            );
+            mach_port_deallocate(mach_task_self(), memoryEntry);
+
+            if (ret != KERN_SUCCESS)
+            {
+                Log(LogLevel::Error, "melonDS JIT: vm_map rx failed (ret=0x%x)\n", ret);
+                abort();
+            }
+
+            // Notify StikDebug via brk #0xf00d (x16=1 = CMD_PREPARE_REGION)
+            __asm__ volatile (
+                "mov x0, %0\n"
+                "mov x1, %1\n"
+                "mov x16, #1\n"
+                "brk #0xf00d"
+                :
+                : "r" ((u64)rxAddr), "r" ((u64)actualSize)
+                : "x0", "x1", "x16"
+            );
+
+            // Create RW mirror via vm_remap
+            vm_address_t rwAddr = 0;
+            vm_prot_t curProt = 0, maxProt = 0;
+            ret = vm_remap(
+                mach_task_self(), &rwAddr, actualSize, 0,
+                VM_FLAGS_ANYWHERE, mach_task_self(), rxAddr, FALSE,
+                &curProt, &maxProt, VM_INHERIT_NONE
+            );
+
+            if (ret != KERN_SUCCESS)
+            {
+                Log(LogLevel::Error, "melonDS JIT: vm_remap rw failed (ret=0x%x)\n", ret);
+                vm_deallocate(mach_task_self(), rxAddr, actualSize);
+                abort();
+            }
+
+            if (mprotect((void*)rwAddr, actualSize, PROT_READ | PROT_WRITE) != 0)
+            {
+                Log(LogLevel::Error, "melonDS JIT: mprotect rw failed (errno=%d)\n", errno);
+                vm_deallocate(mach_task_self(), rwAddr, actualSize);
+                vm_deallocate(mach_task_self(), rxAddr, actualSize);
+                abort();
+            }
+
+            pageAligned = (u8*)rxAddr;
+            JitRWBase_Apple = (void*)rwAddr;
+            JitRXBase_Apple = (void*)rxAddr;
+            JitMemAllocSize_Apple = actualSize;
+            IsDualMapping_Apple = true;
+
+            SetCodeBase((u8*)rwAddr, (u8*)rxAddr);
+            JitMemMainSize = (u32)actualSize;
+            Log(LogLevel::Info, "[MelonDS-JIT] TXM dual-mapping OK: RW=%p, RX=%p, size=0x%x\n",
+                (void*)rwAddr, (void*)rxAddr, (unsigned)actualSize);
+        }
+        else if (isIOS26 && !hasTXM)
+        {
+            // iOS 26+ PPL (non-TXM): dual mapping without brk
+            size_t allocSize = MelonDS_AlignToPage(JitMemSize);
+
+            void* rxPtr = mmap(nullptr, allocSize, PROT_READ | PROT_EXEC,
+                               MAP_ANON | MAP_PRIVATE, -1, 0);
+            if (rxPtr == MAP_FAILED)
+            {
+                Log(LogLevel::Error, "melonDS JIT: mmap rx failed (errno=%d)\n", errno);
+                abort();
+            }
+
+            vm_address_t rwAddr = 0;
+            vm_prot_t curProt = 0, maxProt = 0;
+            kern_return_t ret = vm_remap(
+                mach_task_self(), &rwAddr, allocSize, 0,
+                VM_FLAGS_ANYWHERE, mach_task_self(), (vm_address_t)rxPtr, FALSE,
+                &curProt, &maxProt, VM_INHERIT_NONE
+            );
+
+            if (ret != KERN_SUCCESS)
+            {
+                Log(LogLevel::Error, "melonDS JIT: vm_remap rw failed (ret=0x%x)\n", ret);
+                munmap(rxPtr, allocSize);
+                abort();
+            }
+
+            if (mprotect((void*)rwAddr, allocSize, PROT_READ | PROT_WRITE) != 0)
+            {
+                Log(LogLevel::Error, "melonDS JIT: mprotect rw failed (errno=%d)\n", errno);
+                vm_deallocate(mach_task_self(), rwAddr, allocSize);
+                munmap(rxPtr, allocSize);
+                abort();
+            }
+
+            pageAligned = (u8*)rxPtr;
+            JitRWBase_Apple = (void*)rwAddr;
+            JitRXBase_Apple = rxPtr;
+            JitMemAllocSize_Apple = allocSize;
+            IsDualMapping_Apple = true;
+
+            SetCodeBase((u8*)rwAddr, (u8*)rxPtr);
+            JitMemMainSize = (u32)allocSize;
+            Log(LogLevel::Info, "[MelonDS-JIT] PPL dual-mapping OK: RW=%p, RX=%p, size=0x%x\n",
+                (void*)rwAddr, rxPtr, (unsigned)allocSize);
+        }
+        else
+        {
+            // iOS < 26: use mmap + mprotect (not MAP_JIT).
+            // CS_DEBUGGED (from StikDebug/debugserver) allows mprotect to add PROT_EXEC.
+            // MAP_JIT requires dynamic-codesigning entitlement which sideloaded apps lack.
+            size_t allocSize = MelonDS_AlignToPage(JitMemSize);
+            pageAligned = (u8*)mmap(NULL, allocSize, PROT_READ | PROT_WRITE,
+                                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (pageAligned == MAP_FAILED)
+            {
+                Log(LogLevel::Error, "melonDS JIT: mmap failed (errno=%d)\n", errno);
+            }
+            else
+            {
+                SetCodeBase(pageAligned, pageAligned);
+                JitMemMainSize = (u32)allocSize;
+                IsLegacyMprotect_Apple = true;
+                LegacyJitBase_Apple = pageAligned;
+                LegacyJitSize_Apple = allocSize;
+                Log(LogLevel::Info, "[MelonDS-JIT] Legacy mprotect OK: base=%p, size=0x%zx\n",
+                    (void*)pageAligned, allocSize);
+            }
+        }
+    }
+    #else
+        // macOS: existing MAP_JIT path
+        pageAligned = (u8*)mmap(NULL, JitMemSize, PROT_READ | PROT_WRITE | PROT_EXEC,
+                                MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
         nds.JIT.JitEnableWrite();
+
+        SetCodeBase(pageAligned, pageAligned);
+        JitMemMainSize = JitMemSize;
+    #endif // TARGET_OS_IPHONE
+
     #else
         mprotect(pageAligned, alignedSize, PROT_EXEC | PROT_READ | PROT_WRITE);
-    #endif
 
-    SetCodeBase(pageAligned, pageAligned);
-    JitMemMainSize = alignedSize;
+        SetCodeBase(pageAligned, pageAligned);
+        JitMemMainSize = alignedSize;
+    #endif
 #endif
     SetCodePtr(0);
 
@@ -491,6 +811,30 @@ Compiler::~Compiler()
         succeded = R_SUCCEEDED(svcUnmapProcessCodeMemory(envGetOwnProcessHandle(), (u64)JitRXStart, (u64)JitRWBase, JitMemSize));
         assert(succeded);
         free(JitRWBase);
+    }
+#elif defined(__APPLE__) && defined(__aarch64__)
+    if (IsDualMapping_Apple)
+    {
+        if (JitRWBase_Apple)
+            vm_deallocate(mach_task_self(), (vm_address_t)JitRWBase_Apple, JitMemAllocSize_Apple);
+        if (JitRXBase_Apple)
+        {
+        #if TARGET_OS_IPHONE
+            vm_deallocate(mach_task_self(), (vm_address_t)JitRXBase_Apple, JitMemAllocSize_Apple);
+        #else
+            munmap(JitRXBase_Apple, JitMemAllocSize_Apple);
+        #endif
+        }
+    }
+    else if (IsLegacyMprotect_Apple)
+    {
+        if (LegacyJitBase_Apple)
+            munmap(LegacyJitBase_Apple, LegacyJitSize_Apple);
+    }
+    else
+    {
+        if (GetRXBase())
+            munmap(GetRXBase(), JitMemSize);
     }
 #endif
 }

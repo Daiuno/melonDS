@@ -22,6 +22,14 @@
 #include <assert.h>
 #include <unordered_map>
 
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#if TARGET_OS_IPHONE && defined(__aarch64__)
+#include <dlfcn.h>
+#include <sys/mman.h>
+#endif
+#endif
+
 #define XXH_STATIC_LINKING_ONLY
 #include "xxhash/xxhash.h"
 
@@ -533,6 +541,14 @@ void ARMJIT::SetFastMemory(bool enabled) noexcept
 
 void ARMJIT::CompileBlock(ARM* cpu) noexcept
 {
+    static int compiledBlockCount = 0;
+    if (compiledBlockCount < 3)
+    {
+        compiledBlockCount++;
+        Log(LogLevel::Info, "[MelonDS-JIT] CompileBlock #%d: CPU%d addr=0x%08x\n",
+            compiledBlockCount, cpu->Num, cpu->R[15]);
+    }
+
     bool thumb = cpu->CPSR & 0x20;
 
     u32 blockAddr = cpu->R[15] - (thumb ? 2 : 4);
@@ -1158,19 +1174,64 @@ void ARMJIT::ResetBlockCache() noexcept
     JITCompiler.Reset();
 }
 
+bool ARMJIT::IsDualMappingMode() const noexcept
+{
+#if defined(__APPLE__) && defined(__aarch64__)
+    return JITCompiler.IsDualMapping_Apple;
+#else
+    return false;
+#endif
+}
+
 void ARMJIT::JitEnableWrite() noexcept
 {
     #if defined(__APPLE__) && defined(__aarch64__)
+        if (IsDualMappingMode())
+            return;
+        #if TARGET_OS_IPHONE
+        if (JITCompiler.IsLegacyMprotect_Apple)
+        {
+            if (JITCompiler.LegacyJitBase_Apple)
+                mprotect(JITCompiler.LegacyJitBase_Apple,
+                         JITCompiler.LegacyJitSize_Apple,
+                         PROT_READ | PROT_WRITE);
+        }
+        else
+        {
+            static auto fn = reinterpret_cast<void(*)(int)>(
+                dlsym(RTLD_DEFAULT, "pthread_jit_write_protect_np"));
+            if (fn) fn(false);
+        }
+        #else
         if (__builtin_available(macOS 11.0, *))
             pthread_jit_write_protect_np(false);
+        #endif
     #endif
 }
 
 void ARMJIT::JitEnableExecute() noexcept
 {
     #if defined(__APPLE__) && defined(__aarch64__)
+        if (IsDualMappingMode())
+            return;
+        #if TARGET_OS_IPHONE
+        if (JITCompiler.IsLegacyMprotect_Apple)
+        {
+            if (JITCompiler.LegacyJitBase_Apple)
+                mprotect(JITCompiler.LegacyJitBase_Apple,
+                         JITCompiler.LegacyJitSize_Apple,
+                         PROT_READ | PROT_EXEC);
+        }
+        else
+        {
+            static auto fn = reinterpret_cast<void(*)(int)>(
+                dlsym(RTLD_DEFAULT, "pthread_jit_write_protect_np"));
+            if (fn) fn(true);
+        }
+        #else
         if (__builtin_available(macOS 11.0, *))
             pthread_jit_write_protect_np(true);
+        #endif
     #endif
 }
 
